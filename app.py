@@ -1,60 +1,75 @@
 import sys
-import ctypes
-
-def is_admin():
-    """Check if the script is running with administrator privileges."""
-    try:
-        return ctypes.windll.shell32.IsUserAnAdmin()
-    except:
-        return False
-
-if not is_admin():
-    print("[INIT] Requesting Administrator Privileges...")
-    # Re-launch script with Admin privileges
-    ctypes.windll.shell32.ShellExecuteW(
-        None, "runas", sys.executable, " ".join(sys.argv), None, 1
-    )
-    sys.exit(0)
-
 import os
+import platform
+
+# ══════════════════════════════════════════════════════════
+# OS-SPECIFIC PRIVILEGE HANDLING
+# ══════════════════════════════════════════════════════════
+IS_WINDOWS = platform.system().lower() == 'windows'
+IS_LINUX = platform.system().lower() == 'linux'
+
+if IS_WINDOWS:
+    import ctypes
+
+    def is_admin():
+        try:
+            return ctypes.windll.shell32.IsUserAnAdmin()
+        except Exception:
+            return False
+
+    if not is_admin():
+        print("[INIT] Requesting Administrator Privileges...")
+        ctypes.windll.shell32.ShellExecuteW(
+            None, "runas", sys.executable, " ".join(sys.argv), None, 1
+        )
+        sys.exit(0)
+
+elif IS_LINUX:
+    if os.geteuid() != 0:
+        print("[INIT] Linux mode: non-root user detected.")
+        print("       icmplib needs CAP_NET_RAW. Fix if privileged ping fails:")
+        print("       sudo setcap cap_net_raw+ep $(readlink -f $(which python3))")
+        print("       OR use systemd AmbientCapabilities=CAP_NET_RAW")
+
+# ══════════════════════════════════════════════════════════
 import csv
 import io
 import logging
+import queue as _queue
+import json
 from datetime import datetime
 from flask import (
     Flask, render_template, request, jsonify,
-    redirect, url_for, flash
+    redirect, url_for, flash, Response
 )
 from flask_apscheduler import APScheduler
 from config import Config
 from models import db, Node, DowntimeLog
 from monitor import monitor
+from events import subscribe, unsubscribe, publish, subscriber_count
 
-# Disable Flask access logs (cleaner output)
+# Disable noisy werkzeug logs
 log = logging.getLogger('werkzeug')
 log.setLevel(logging.ERROR)
 
 app = Flask(__name__)
 app.config.from_object(Config)
 
-# Ensure upload folder exists
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
-# Initialize extensions
 db.init_app(app)
 
-# ============ FIX: Only initialize scheduler ONCE ============
-# When Flask debug=True, the app starts twice. We need to detect this.
+
 def is_main_process():
-    """Check if this is the main Werkzeug process (not the reloader)."""
     return os.environ.get('WERKZEUG_RUN_MAIN') == 'true' or not app.debug
 
-# Initialize monitor only in main process
+
 if is_main_process():
     monitor.init_app(app)
 
-# Setup scheduler ONLY in main process
+
 scheduler = APScheduler()
+
 
 @scheduler.task(
     'interval',
@@ -65,28 +80,31 @@ scheduler = APScheduler()
     coalesce=True
 )
 def scheduled_monitor():
-    """Scheduled job to monitor all nodes."""
     with app.app_context():
         monitor.monitor_all_nodes()
 
-# Create tables
+
+# ══════════════════════════════════════════════════════════
+# DB INIT — cross-platform (PostgreSQL ও SQLite দুটোই support)
+# ══════════════════════════════════════════════════════════
 with app.app_context():
     db.create_all()
-    # Enable SQLite WAL mode for better concurrent performance with 290+ devices
-    with db.engine.connect() as conn:
-        conn.execute(db.text("PRAGMA journal_mode=WAL"))
-        conn.execute(db.text("PRAGMA synchronous=NORMAL"))
-        conn.execute(db.text("PRAGMA cache_size=-10000"))
-        conn.execute(db.text("PRAGMA busy_timeout=30000"))
-        conn.commit()
-    print("[DB] SQLite WAL mode enabled - optimized for concurrent access")
+    # SQLite-specific pragma — PostgreSQL-এ skip
+    if app.config['SQLALCHEMY_DATABASE_URI'].startswith('sqlite'):
+        with db.engine.connect() as conn:
+            conn.execute(db.text("PRAGMA journal_mode=WAL"))
+            conn.execute(db.text("PRAGMA synchronous=NORMAL"))
+            conn.execute(db.text("PRAGMA busy_timeout=30000"))
+            conn.commit()
+        print("[DB] SQLite WAL mode enabled")
+    else:
+        print("[DB] PostgreSQL connected — tables ready")
 
-# Start scheduler only in main process
+
 if is_main_process():
     scheduler.init_app(app)
     scheduler.start()
 
-    # Initial ping at startup
     import threading
     def initial_ping():
         import time
@@ -97,16 +115,18 @@ if is_main_process():
 
     threading.Thread(target=initial_ping, daemon=True).start()
 
-# ============ WEB ROUTES ============
+
+# ══════════════════════════════════════════════════════════
+# WEB ROUTES
+# ══════════════════════════════════════════════════════════
 
 @app.route('/')
 def index():
-    """Main dashboard page."""
     return render_template('index.html')
+
 
 @app.route('/add', methods=['GET', 'POST'])
 def add_node():
-    """Add a new node."""
     if request.method == 'POST':
         node_name = request.form.get('node_name', '').strip()
         ip_address = request.form.get('ip_address', '').strip()
@@ -139,9 +159,9 @@ def add_node():
 
     return render_template('add_node.html')
 
+
 @app.route('/edit/<int:node_id>', methods=['GET', 'POST'])
 def edit_node(node_id):
-    """Edit an existing node."""
     node = db.session.get(Node, node_id)
     if not node:
         flash('Node not found.', 'error')
@@ -168,7 +188,6 @@ def edit_node(node_id):
         node.ip_address = ip_address
         node.enabled = enabled
         node.updated_at = datetime.utcnow()
-
         db.session.commit()
 
         flash(f'Node "{node_name}" updated successfully.', 'success')
@@ -176,9 +195,9 @@ def edit_node(node_id):
 
     return render_template('edit_node.html', node=node)
 
+
 @app.route('/delete/<int:node_id>', methods=['POST'])
 def delete_node(node_id):
-    """Delete a node."""
     node = db.session.get(Node, node_id)
     if not node:
         flash('Node not found.', 'error')
@@ -191,9 +210,9 @@ def delete_node(node_id):
     flash(f'Node "{node_name}" deleted successfully.', 'success')
     return redirect(url_for('index'))
 
+
 @app.route('/upload', methods=['GET', 'POST'])
 def upload_csv():
-    """Upload nodes from CSV file."""
     if request.method == 'POST':
         if 'csv_file' not in request.files:
             flash('No file selected.', 'error')
@@ -231,7 +250,7 @@ def upload_csv():
                 ).strip()
 
                 if not node_name or not ip_address:
-                    errors.append(f"Row {row_num}: Missing node name or IP address")
+                    errors.append(f"Row {row_num}: Missing node name or IP")
                     skipped += 1
                     continue
 
@@ -251,7 +270,7 @@ def upload_csv():
 
             db.session.commit()
 
-            msg = f'Successfully added {added} nodes. Skipped {skipped} (duplicates/errors).'
+            msg = f'Successfully added {added} nodes. Skipped {skipped}.'
             if errors:
                 msg += f' Errors: {"; ".join(errors[:5])}'
 
@@ -270,11 +289,13 @@ def upload_csv():
 
     return render_template('upload_csv.html')
 
-# ============ API ROUTES ============
+
+# ══════════════════════════════════════════════════════════
+# API — NODES
+# ══════════════════════════════════════════════════════════
 
 @app.route('/api/nodes')
 def api_get_nodes():
-    """API endpoint to get all nodes with sorting."""
     sort_by = request.args.get('sort', 'since_last_change')
     order = request.args.get('order', 'asc')
 
@@ -291,15 +312,9 @@ def api_get_nodes():
     sort_column = sort_map.get(sort_by, Node.last_status_change)
 
     if sort_by == 'since_last_change':
-        if order == 'asc':
-            nodes = Node.query.order_by(sort_column.desc()).all()
-        else:
-            nodes = Node.query.order_by(sort_column.asc()).all()
+        nodes = Node.query.order_by(sort_column.desc() if order == 'asc' else sort_column.asc()).all()
     else:
-        if order == 'desc':
-            nodes = Node.query.order_by(sort_column.desc()).all()
-        else:
-            nodes = Node.query.order_by(sort_column.asc()).all()
+        nodes = Node.query.order_by(sort_column.desc() if order == 'desc' else sort_column.asc()).all()
 
     return jsonify({
         'nodes': [node.to_dict() for node in nodes],
@@ -308,17 +323,17 @@ def api_get_nodes():
         'order': order
     })
 
+
 @app.route('/api/nodes/<int:node_id>')
 def api_get_single_node(node_id):
-    """API endpoint to get a single node."""
     node = db.session.get(Node, node_id)
     if not node:
         return jsonify({'error': 'Node not found'}), 404
     return jsonify(node.to_dict())
 
+
 @app.route('/api/nodes/<int:node_id>/ping', methods=['POST'])
 def api_ping_node(node_id):
-    """Manually trigger ping for a single node."""
     node = db.session.get(Node, node_id)
     if not node:
         return jsonify({'error': 'Node not found'}), 404
@@ -328,9 +343,9 @@ def api_ping_node(node_id):
 
     return jsonify(node.to_dict())
 
+
 @app.route('/api/nodes/delete', methods=['POST'])
 def api_delete_node():
-    """Delete node via API."""
     data = request.get_json()
     node_id = data.get('node_id')
 
@@ -343,9 +358,9 @@ def api_delete_node():
 
     return jsonify({'success': True})
 
+
 @app.route('/api/refresh', methods=['POST'])
 def api_refresh_all():
-    """Trigger manual refresh of all nodes."""
     import threading
     t = threading.Thread(target=monitor.monitor_all_nodes)
     t.daemon = True
@@ -353,25 +368,64 @@ def api_refresh_all():
 
     return jsonify({'success': True, 'message': 'Refresh started'})
 
-# ============ DOWNTIME LOG ROUTES ============
+
+# ══════════════════════════════════════════════════════════
+# SSE — Server-Sent Events
+# ══════════════════════════════════════════════════════════
+
+@app.route('/api/stream')
+def stream():
+    def event_stream():
+        q = subscribe()
+        try:
+            yield f"data: {json.dumps({'type': 'connected'})}\n\n"
+            while True:
+                try:
+                    event = q.get(timeout=25)
+                    yield f"data: {json.dumps(event)}\n\n"
+                except _queue.Empty:
+                    yield ": keepalive\n\n"
+        except GeneratorExit:
+            pass
+        finally:
+            unsubscribe(q)
+
+    return Response(
+        event_stream(),
+        mimetype='text/event-stream',
+        headers={
+            'Cache-Control': 'no-cache',
+            'X-Accel-Buffering': 'no',
+            'Connection': 'keep-alive',
+        }
+    )
+
+
+@app.route('/api/sse/stats')
+def sse_stats():
+    return jsonify({'subscribers': subscriber_count()})
+
+
+# ══════════════════════════════════════════════════════════
+# DOWNTIME LOGS
+# ══════════════════════════════════════════════════════════
 
 @app.route('/node/<int:node_id>')
 def node_detail(node_id):
-    """Node detail page with downtime timeline."""
     node = db.session.get(Node, node_id)
     if not node:
         flash('Node not found.', 'error')
         return redirect(url_for('index'))
     return render_template('node_detail.html', node=node)
 
+
 @app.route('/logs')
 def downtime_logs():
-    """Downtime logs page."""
     return render_template('downtime_logs.html')
+
 
 @app.route('/api/logs')
 def api_get_logs():
-    """API endpoint to get downtime logs with filtering & pagination."""
     page = request.args.get('page', 1, type=int)
     per_page = request.args.get('per_page', 50, type=int)
     node_id = request.args.get('node_id', None, type=int)
@@ -380,7 +434,6 @@ def api_get_logs():
 
     query = DowntimeLog.query
 
-    # Filters
     if node_id:
         query = query.filter_by(node_id=node_id)
     if status_filter:
@@ -390,10 +443,7 @@ def api_get_logs():
     elif resolved == 'false':
         query = query.filter_by(is_resolved=False)
 
-    # Order by newest first
     query = query.order_by(DowntimeLog.timestamp.desc())
-
-    # Paginate
     pagination = query.paginate(page=page, per_page=per_page, error_out=False)
     logs = pagination.items
 
@@ -407,9 +457,9 @@ def api_get_logs():
         'has_prev': pagination.has_prev
     })
 
+
 @app.route('/api/logs/node/<int:node_id>/stats')
 def api_node_log_stats(node_id):
-    """API endpoint for per-node log statistics."""
     node = db.session.get(Node, node_id)
     if not node:
         return jsonify({'error': 'Node not found'}), 404
@@ -417,7 +467,6 @@ def api_node_log_stats(node_id):
     total_down = DowntimeLog.query.filter_by(node_id=node_id, status_change='Node Down').count()
     total_up = DowntimeLog.query.filter_by(node_id=node_id, status_change='Node Up').count()
 
-    # Total downtime
     resolved_down = DowntimeLog.query.filter(
         DowntimeLog.node_id == node_id,
         DowntimeLog.status_change == 'Node Down',
@@ -427,11 +476,8 @@ def api_node_log_stats(node_id):
 
     total_downtime = sum(l.downtime_duration for l in resolved_down if l.downtime_duration)
     avg_downtime = total_downtime / len(resolved_down) if resolved_down else 0
-
-    # Max downtime
     max_downtime = max((l.downtime_duration for l in resolved_down if l.downtime_duration), default=0)
 
-    # Calculate uptime percentage (from node creation)
     if node.created_at:
         total_lifetime = (datetime.utcnow() - node.created_at).total_seconds()
         availability = round(((total_lifetime - total_downtime) / total_lifetime) * 100, 2) if total_lifetime > 0 else 100
@@ -450,15 +496,14 @@ def api_node_log_stats(node_id):
         'availability': availability
     })
 
+
 @app.route('/api/logs/stats')
 def api_log_stats():
-    """API endpoint for log summary statistics."""
     total_logs = DowntimeLog.query.count()
     unresolved = DowntimeLog.query.filter_by(is_resolved=False).count()
     down_events = DowntimeLog.query.filter_by(status_change='Node Down').count()
     up_events = DowntimeLog.query.filter_by(status_change='Node Up').count()
 
-    # Average downtime
     resolved_logs = DowntimeLog.query.filter(
         DowntimeLog.status_change == 'Node Down',
         DowntimeLog.is_resolved == True,
@@ -482,9 +527,9 @@ def api_log_stats():
         'max_downtime': round(max_downtime, 1)
     })
 
+
 @app.route('/api/logs/clear', methods=['POST'])
 def api_clear_logs():
-    """Clear all downtime logs."""
     try:
         num_deleted = db.session.query(DowntimeLog).delete()
         db.session.commit()
@@ -492,9 +537,9 @@ def api_clear_logs():
     except Exception as e:
         return jsonify({'error': str(e)}), 500
 
+
 @app.route('/api/stats')
 def api_stats():
-    """Get summary statistics."""
     total = Node.query.count()
     up = Node.query.filter_by(status='Node Up').count()
     down = Node.query.filter_by(status='Node Down').count()
@@ -509,13 +554,16 @@ def api_stats():
         'unknown': unknown
     })
 
+
+# ══════════════════════════════════════════════════════════
 if __name__ == '__main__':
-    # For development: python app.py
-    # For production with 290+ devices: gunicorn --workers 2 --threads 4 --bind 0.0.0.0:3000 app:app
-    app.run(
-        debug=False,
+    from waitress import serve
+    print("[SERVER] Starting waitress on 0.0.0.0:3000")
+    serve(
+        app,
         host='0.0.0.0',
         port=3000,
-        threaded=True,
-        use_reloader=False
+        threads=32,
+        channel_timeout=120,
+        connection_limit=200,
     )

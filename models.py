@@ -1,25 +1,18 @@
 from flask_sqlalchemy import SQLAlchemy
 from datetime import datetime, timedelta
 
-# Bangladesh timezone UTC+6
 BD_OFFSET = timedelta(hours=6)
 
+
 def bd_time(utc_dt):
-    """Convert UTC datetime to Bangladesh time for display."""
     if utc_dt is None:
         return None
     return utc_dt + BD_OFFSET
 
-db = SQLAlchemy(engine_options={
-    'pool_size': 20,
-    'max_overflow': 30,
-    'pool_pre_ping': True,
-    'pool_recycle': 300,
-    'connect_args': {
-        'timeout': 30,
-        'check_same_thread': False
-    }
-})
+
+# Engine options config.py থেকে আসবে — models.py-তে hardcode নয়
+db = SQLAlchemy()
+
 
 class Node(db.Model):
     __tablename__ = 'nodes'
@@ -29,7 +22,7 @@ class Node(db.Model):
     ip_address = db.Column(db.String(45), nullable=False, unique=True)
     response_time = db.Column(db.Float, default=0.0)
     packet_loss = db.Column(db.Float, default=0.0)
-    status = db.Column(db.String(20), default='Unknown')  # Node Up, Node Down, Warning, Unknown
+    status = db.Column(db.String(20), default='Unknown')
     last_status_change = db.Column(db.DateTime, default=datetime.utcnow)
     last_checked = db.Column(db.DateTime, default=None, nullable=True)
     previous_status = db.Column(db.String(20), default='Unknown')
@@ -37,10 +30,14 @@ class Node(db.Model):
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     enabled = db.Column(db.Boolean, default=True)
 
-    # ============ FLAP PROTECTION COUNTERS ============
     consecutive_failures = db.Column(db.Integer, default=0)
     consecutive_successes = db.Column(db.Integer, default=0)
     last_ping_success = db.Column(db.Boolean, default=None, nullable=True)
+
+    __table_args__ = (
+        db.Index('idx_nodes_enabled', 'enabled'),
+        db.Index('idx_nodes_status', 'status'),
+    )
 
     def to_dict(self):
         now = datetime.utcnow()
@@ -93,11 +90,17 @@ class DowntimeLog(db.Model):
     node_id = db.Column(db.Integer, db.ForeignKey('nodes.id'), nullable=False)
     node_name = db.Column(db.String(255), nullable=False)
     ip_address = db.Column(db.String(45), nullable=False)
-    status_change = db.Column(db.String(20), nullable=False)  # 'Node Down', 'Node Up', 'Warning'
+    status_change = db.Column(db.String(20), nullable=False)
     previous_status = db.Column(db.String(20), default='Unknown')
     timestamp = db.Column(db.DateTime, default=datetime.utcnow)
-    downtime_duration = db.Column(db.Float, default=None, nullable=True)  # Duration in seconds (set when node comes back up)
+    downtime_duration = db.Column(db.Float, default=None, nullable=True)
     is_resolved = db.Column(db.Boolean, default=False)
+
+    __table_args__ = (
+        db.Index('idx_logs_timestamp', timestamp.desc()),
+        db.Index('idx_logs_node_id_ts', 'node_id', timestamp.desc()),
+        db.Index('idx_logs_status_change', 'status_change'),
+    )
 
     def to_dict(self):
         duration_str = None
